@@ -20,7 +20,7 @@ Status: Approved design, pending spec review
 1. On a phone browser, pointing the camera at a page shows a stable live outline and auto-captures within ~1 s of holding steady.
 2. Detected corners land within 2% of the image diagonal of hand-marked ground truth on the fixture set (excluding the "no page" fixture, which must return no quad).
 3. Exported multi-page PDF opens in standard viewers, and its text is searchable/selectable.
-4. App works fully offline after first load; CSP blocks all non-self network requests.
+4. App works fully offline after first load; a CSP blocks all non-self network requests, enforced by response header where the host supports it (config shipped: `_headers` generated into the build, nginx snippet in `docs/deploy.md`); page-level meta otherwise.
 
 ## 2. Architecture
 
@@ -60,14 +60,16 @@ Re-crop / re-filter regenerates `processedBlob` from `originalBlob`.
 ### Network policy
 CSP: `default-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; worker-src 'self' blob:; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'`. All libraries and language data self-hosted. No analytics.
 
+OpenCV.js (embind) builds some helpers with `new Function`, which this CSP forbids (no `'unsafe-eval'`). Rather than allowing eval, `build/opencvNoEval.ts` patches OpenCV.js at build time, rewriting the four code-generation sites (`createNamedFunction`, `makeDynCaller`, `craftInvokerFunction`, `__emval_get_method_caller`) into closures. The build throws if an expected site is missing, and a `generateBundle` scan fails it if any `new Function`/`eval(` remains in the OpenCV chunk.
+
 ## 3. Scan pipeline
 
 ### Live detection
 1. Rear camera via `getUserMedia({video:{facingMode:'environment', width:{ideal:4096}}})`.
 2. ~10 Hz: draw video frame to OffscreenCanvas downscaled so long side = 480 px; transfer `ImageData` to worker. Drop frames while a detection is in flight.
-3. Worker: grayscale → GaussianBlur 5×5 → Canny with thresholds `0.66·median`, `1.33·median` → dilate 3×3 once.
-4. `findContours(RETR_EXTERNAL)` → for each, `approxPolyDP(ε = 0.02·perimeter)`. Keep candidates that are 4-vertex, convex, area ≥ 20% of frame, every interior angle in [45°, 135°]. Choose largest area.
-5. Fallback if none: Otsu threshold → morphological close → same contour filter.
+3. Worker: grayscale → GaussianBlur 5×5 → Canny with thresholds `0.66·median`, `1.33·median` (median of the blurred gray) → dilate 3×3 once.
+4. `findContours(RETR_EXTERNAL)` → for each, `approxPolyDP(ε = 0.02·perimeter)`. Keep candidates that are 4-vertex, convex, area ≥ 20% of frame, every interior angle in [45°, 135°], and not a whole-frame artifact (rejected only when each ordered corner lies within 1%, per axis of the respective dimension, of its own frame corner: TL↔(0,0), TR↔(w,0), BR↔(w,h), BL↔(0,h); a page merely spanning the full width or height is kept). Choose largest area.
+5. Cascade if none: retry steps 3–4 with Canny thresholds `0.33·median`, `0.66·median` (catches low-contrast page edges, e.g. white paper on a light desk); if still none, Otsu threshold → morphological close → same contour filter (the border rule stops Otsu's text-vs-everything split from returning the frame). No valid quad → null.
 6. Scale quad to full-res coordinates; order corners TL/TR/BR/BL (sum/diff method in `geometry.ts`).
 
 ### Overlay & auto-capture
